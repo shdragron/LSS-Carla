@@ -1,0 +1,43 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "LSS: eval_model_iou (trainval)_nuScenes",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/main.py",
+      "args": [
+        "eval_model_iou",
+        "trainval",
+        "--modelf=./model525000.pt",
+        "--dataroot=/data/nuscenes/"
+      ],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "PYTHONUNBUFFERED": "1",
+        "HYDRA_FULL_ERROR": "1"
+      }
+    },
+    {
+      "name": "LSS: eval_model_iou (trainval)_SimBEV",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/main.py",
+      "args": [
+        "eval_model_iou",
+        "trainval",
+        "--modelf=./model525000.pt",
+        "--dataroot=/data/simbev_processed/"
+      ],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "PYTHONUNBUFFERED": "1",
+        "HYDRA_FULL_ERROR": "1"
+      }
+    }
+  ]
+}

@@ -36,7 +36,7 @@ def train(version,
             zbound=[-10.0, 10.0, 20.0],
             dbound=[4.0, 45.0, 1.0],
 
-            bsz=4,
+            bsz=16,
             nworkers=10,
             lr=1e-3,
             weight_decay=1e-7,
@@ -96,11 +96,11 @@ def train(version,
             counter += 1
             t1 = time()
 
-            if counter % 10 == 0:
+            if counter % 50 == 0:
                 print(counter, loss.item())
                 writer.add_scalar('train/loss', loss, counter)
 
-            if counter % 50 == 0:
+            if counter % 100 == 0:
                 _, _, iou = get_batch_iou(preds, binimgs)
                 writer.add_scalar('train/iou', iou, counter)
                 writer.add_scalar('train/epoch', epoch, counter)

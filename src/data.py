@@ -1,241 +1,261 @@
 """
-Copyright (C) 2020 NVIDIA Corporation.  All rights reserved.
-Licensed under the NVIDIA Source Code License. See LICENSE at https://github.com/nv-tlabs/lift-splat-shoot.
-Authors: Jonah Philion and Sanja Fidler
+SimBEV (file-based) Dataset for LSS-style loaders
+- Reads SimBEV exported frames instead of nuScenes API.
+- Keeps return signatures compatible with the original LSS dataset classes.
 """
 
-import torch
 import os
-import numpy as np
-from PIL import Image
-import cv2
-from pyquaternion import Quaternion
-from nuscenes.nuscenes import NuScenes
-from nuscenes.utils.splits import create_splits_scenes
-from nuscenes.utils.data_classes import Box
+import json
 from glob import glob
+from pathlib import Path
+from typing import Dict, Any, List
+import torch.nn.functional as F
 
-from .tools import get_lidar_data, img_transform, normalize_img, gen_dx_bx
+import torch
+import numpy as np
+
+# LSS code often imports these utilities; here we only need gen_dx_bx if grid_conf is used elsewhere.
+from .tools import gen_dx_bx
 
 
-class NuscData(torch.utils.data.Dataset):
-    def __init__(self, nusc, is_train, data_aug_conf, grid_conf):
-        self.nusc = nusc
+class SimBEV(torch.utils.data.Dataset):
+    """
+    File-based SimBEV dataset.
+
+    Directory layout (example):
+      data_dir/
+        train_samples.json
+        val_samples.json
+        train/
+          scene-xxx/123456789012345_abcdef12/
+            images.pt            # (6,3,H,W) float [0..1]
+            intrinsics.pt        # (6,3,3)
+            extrinsics.pt        # (6,4,4)  (assumed: ego -> camera)
+            bev.npy              # (1,Hbev,Wbev) float
+            center_heatmap.npy   # (1,Hbev,Wbev) float
+            visibility.npy       # (Hbev,Wbev)   uint8
+            meta.json            # dict: { "view": 3x3, "pose": 4x4 (T_global_ego), "cam_idx": [0..5], ...}
+        val/
+          ...
+
+    Notes:
+      - We convert extrinsics (ego->cam) to LSS' (sensor->ego == cam->ego) by inverting.
+      - No on-the-fly augmentation: post_rots = I(3), post_trans = 0(3).
+    """
+
+    def __init__(self, data_dir: str, is_train: bool, data_aug_conf: Dict[str, Any], grid_conf: Dict[str, Any]):
+        self.data_dir = Path(data_dir)
         self.is_train = is_train
         self.data_aug_conf = data_aug_conf
         self.grid_conf = grid_conf
 
-        self.scenes = self.get_scenes()
-        self.ixes = self.prepro()
+        self.split = 'train' if is_train else 'val'
+        self.sample_infos = self._load_split_index(self.split)
 
+        # optional: for BEV grid params, if others depend on them
         dx, bx, nx = gen_dx_bx(grid_conf['xbound'], grid_conf['ybound'], grid_conf['zbound'])
         self.dx, self.bx, self.nx = dx.numpy(), bx.numpy(), nx.numpy()
 
-        self.fix_nuscenes_formatting()
+        # expected camera count / selection config
+        self.all_cam_indices = None  # will read per-frame from meta['cam_idx']
 
         print(self)
 
-    def fix_nuscenes_formatting(self):
-        """If nuscenes is stored with trainval/1 trainval/2 ... structure, adjust the file paths
-        stored in the nuScenes object.
-        """
-        # check if default file paths work
-        rec = self.ixes[0]
-        sampimg = self.nusc.get('sample_data', rec['data']['CAM_FRONT'])
-        imgname = os.path.join(self.nusc.dataroot, sampimg['filename'])
+    # -----------------------------
+    # Split index / IO
+    # -----------------------------
+    def _load_split_index(self, split: str) -> List[Dict[str, Any]]:
+        # 1) data_dir/{split}_samples.json
+        p = self.data_dir / f"{split}_samples.json"
+        # 2) fallback: data_dir/{split}/{split}_samples.json
+        if not p.exists():
+            p = self.data_dir / split / f"{split}_samples.json"
+        if not p.exists():
+            raise FileNotFoundError(
+                f"Cannot find samples file: tried\n"
+                f"  • {self.data_dir / f'{split}_samples.json'}\n"
+                f"  • {self.data_dir / split / f'{split}_samples.json'}"
+            )
+        with open(p, 'r') as f:
+            sample_infos = json.load(f)
+        return sample_infos
 
-        def find_name(f):
-            d, fi = os.path.split(f)
-            d, di = os.path.split(d)
-            d, d0 = os.path.split(d)
-            d, d1 = os.path.split(d)
-            d, d2 = os.path.split(d)
-            return di, fi, f'{d2}/{d1}/{d0}/{di}/{fi}'
+    def _frame_dir(self, info: Dict[str, Any]) -> Path:
+        # info['folder'] is relative to data_dir/split/
+        return self.data_dir / self.split / info['folder']
 
-        # adjust the image paths if needed
-        if not os.path.isfile(imgname):
-            print('adjusting nuscenes file paths')
-            fs = glob(os.path.join(self.nusc.dataroot, 'samples/*/samples/CAM*/*.jpg'))
-            fs += glob(os.path.join(self.nusc.dataroot, 'samples/*/samples/LIDAR_TOP/*.pcd.bin'))
-            info = {}
-            for f in fs:
-                di, fi, fname = find_name(f)
-                info[f'samples/{di}/{fi}'] = fname
-            fs = glob(os.path.join(self.nusc.dataroot, 'sweeps/*/sweeps/LIDAR_TOP/*.pcd.bin'))
-            for f in fs:
-                di, fi, fname = find_name(f)
-                info[f'sweeps/{di}/{fi}'] = fname
-            for rec in self.nusc.sample_data:
-                if rec['channel'] == 'LIDAR_TOP' or (rec['is_key_frame'] and rec['channel'] in self.data_aug_conf['cams']):
-                    rec['filename'] = info[rec['filename']]
-
-    
-    def get_scenes(self):
-        # filter by scene split
-        split = {
-            'v1.0-trainval': {True: 'train', False: 'val'},
-            'v1.0-mini': {True: 'mini_train', False: 'mini_val'},
-        }[self.nusc.version][self.is_train]
-
-        scenes = create_splits_scenes()[split]
-
-        return scenes
-
-    def prepro(self):
-        samples = [samp for samp in self.nusc.sample]
-
-        # remove samples that aren't in this split
-        samples = [samp for samp in samples if
-                   self.nusc.get('scene', samp['scene_token'])['name'] in self.scenes]
-
-        # sort by scene, timestamp (only to make chronological viz easier)
-        samples.sort(key=lambda x: (x['scene_token'], x['timestamp']))
-
-        return samples
-    
-    def sample_augmentation(self):
-        H, W = self.data_aug_conf['H'], self.data_aug_conf['W']
-        fH, fW = self.data_aug_conf['final_dim']
-        if self.is_train:
-            resize = np.random.uniform(*self.data_aug_conf['resize_lim'])
-            resize_dims = (int(W*resize), int(H*resize))
-            newW, newH = resize_dims
-            crop_h = int((1 - np.random.uniform(*self.data_aug_conf['bot_pct_lim']))*newH) - fH
-            crop_w = int(np.random.uniform(0, max(0, newW - fW)))
-            crop = (crop_w, crop_h, crop_w + fW, crop_h + fH)
-            flip = False
-            if self.data_aug_conf['rand_flip'] and np.random.choice([0, 1]):
-                flip = True
-            rotate = np.random.uniform(*self.data_aug_conf['rot_lim'])
-        else:
-            resize = max(fH/H, fW/W)
-            resize_dims = (int(W*resize), int(H*resize))
-            newW, newH = resize_dims
-            crop_h = int((1 - np.mean(self.data_aug_conf['bot_pct_lim']))*newH) - fH
-            crop_w = int(max(0, newW - fW) / 2)
-            crop = (crop_w, crop_h, crop_w + fW, crop_h + fH)
-            flip = False
-            rotate = 0
-        return resize, resize_dims, crop, flip, rotate
-
-    def get_image_data(self, rec, cams):
-        imgs = []
-        rots = []
-        trans = []
-        intrins = []
-        post_rots = []
-        post_trans = []
-        for cam in cams:
-            samp = self.nusc.get('sample_data', rec['data'][cam])
-            imgname = os.path.join(self.nusc.dataroot, samp['filename'])
-            img = Image.open(imgname)
-            post_rot = torch.eye(2)
-            post_tran = torch.zeros(2)
-
-            sens = self.nusc.get('calibrated_sensor', samp['calibrated_sensor_token'])
-            intrin = torch.Tensor(sens['camera_intrinsic'])
-            rot = torch.Tensor(Quaternion(sens['rotation']).rotation_matrix)
-            tran = torch.Tensor(sens['translation'])
-
-            # augmentation (resize, crop, horizontal flip, rotate)
-            resize, resize_dims, crop, flip, rotate = self.sample_augmentation()
-            img, post_rot2, post_tran2 = img_transform(img, post_rot, post_tran,
-                                                     resize=resize,
-                                                     resize_dims=resize_dims,
-                                                     crop=crop,
-                                                     flip=flip,
-                                                     rotate=rotate,
-                                                     )
-            
-            # for convenience, make augmentation matrices 3x3
-            post_tran = torch.zeros(3)
-            post_rot = torch.eye(3)
-            post_tran[:2] = post_tran2
-            post_rot[:2, :2] = post_rot2
-
-            imgs.append(normalize_img(img))
-            intrins.append(intrin)
-            rots.append(rot)
-            trans.append(tran)
-            post_rots.append(post_rot)
-            post_trans.append(post_tran)
-
-        return (torch.stack(imgs), torch.stack(rots), torch.stack(trans),
-                torch.stack(intrins), torch.stack(post_rots), torch.stack(post_trans))
-
-    def get_lidar_data(self, rec, nsweeps):
-        pts = get_lidar_data(self.nusc, rec,
-                       nsweeps=nsweeps, min_distance=2.2)
-        return torch.Tensor(pts)[:3]  # x,y,z
-
-    def get_binimg(self, rec):
-        egopose = self.nusc.get('ego_pose',
-                                self.nusc.get('sample_data', rec['data']['LIDAR_TOP'])['ego_pose_token'])
-        trans = -np.array(egopose['translation'])
-        rot = Quaternion(egopose['rotation']).inverse
-        img = np.zeros((self.nx[0], self.nx[1]))
-        for tok in rec['anns']:
-            inst = self.nusc.get('sample_annotation', tok)
-            # add category for lyft
-            if not inst['category_name'].split('.')[0] == 'vehicle':
-                continue
-            box = Box(inst['translation'], inst['size'], Quaternion(inst['rotation']))
-            box.translate(trans)
-            box.rotate(rot)
-
-            pts = box.bottom_corners()[:2].T
-            pts = np.round(
-                (pts - self.bx[:2] + self.dx[:2]/2.) / self.dx[:2]
-                ).astype(np.int32)
-            pts[:, [1, 0]] = pts[:, [0, 1]]
-            cv2.fillPoly(img, [pts], 1.0)
-
-        return torch.Tensor(img).unsqueeze(0)
-
-    def choose_cams(self):
-        if self.is_train and self.data_aug_conf['Ncams'] < len(self.data_aug_conf['cams']):
-            cams = np.random.choice(self.data_aug_conf['cams'], self.data_aug_conf['Ncams'],
-                                    replace=False)
-        else:
-            cams = self.data_aug_conf['cams']
+    # -----------------------------
+    # LSS-style API
+    # -----------------------------
+    def choose_cams(self, cam_idx_list: List[int]) -> List[int]:
+        """Optionally subsample cameras like original LSS."""
+        cams = cam_idx_list
+        if self.is_train and 'Ncams' in self.data_aug_conf and self.data_aug_conf['Ncams'] < len(cam_idx_list):
+            # Random subset without replacement
+            N = self.data_aug_conf['Ncams']
+            # keep ordering reproducible if needed: np.random.choice
+            cams = sorted(np.random.choice(cam_idx_list, N, replace=False).tolist())
         return cams
 
-    def __str__(self):
-        return f"""NuscData: {len(self)} samples. Split: {"train" if self.is_train else "val"}.
-                   Augmentation Conf: {self.data_aug_conf}"""
+    def _load_frame_tensors(self, frame_dir: Path):
+        images = torch.load(frame_dir / "images.pt")          # (Cams,3,H,W) float [0..1]
+        intrinsics = torch.load(frame_dir / "intrinsics.pt")  # (Cams,3,3)
+        extrinsics = torch.load(frame_dir / "extrinsics.pt")  # (Cams,4,4)  ego->cam
+        bev = torch.from_numpy(np.load(frame_dir / "bev.npy")).float()  # (1,Hbev,Wbev)
+        # Optional (unused in SegmentationData): center/visibility available
+        # center = torch.from_numpy(np.load(frame_dir / "center_heatmap.npy")).float()
+        # visibility = torch.from_numpy(np.load(frame_dir / "visibility.npy")).long()
 
+        with open(frame_dir / "meta.json", "r") as f:
+            meta = json.load(f)
+
+        cam_idx = meta.get("cam_idx", list(range(images.shape[0])))  # e.g., [0..5]
+
+        return images, intrinsics, extrinsics, bev, meta, cam_idx
+
+    def get_image_data(self, info: Dict[str, Any], cam_indices: List[int]):
+        """
+        Returns (imgs, rots, trans, intrins, post_rots, post_trans)
+        - imgs:        (N,3,H,W) float
+        - rots:        (N,3,3)   rotation (sensor->ego == cam->ego)
+        - trans:       (N,3)     translation (sensor->ego)
+        - intrins:     (N,3,3)
+        - post_rots:   (N,3,3)   identity (no aug)
+        - post_trans:  (N,3)     zeros (no aug)
+        """
+        frame_dir = self._frame_dir(info)
+        images, intrinsics, extrinsics, _, meta, cam_idx_all = self._load_frame_tensors(frame_dir)
+
+        # choose/reorder
+        sel = torch.tensor(cam_indices, dtype=torch.long)
+        imgs = images.index_select(0, sel).contiguous()
+        intrins = intrinsics.index_select(0, sel).contiguous()
+        extri = extrinsics.index_select(0, sel).contiguous()  # ego->cam
+
+        # Convert to LSS' rots/trans: sensor->ego (i.e., cam->ego)
+        # For each 4x4 T_ec (ego->cam), invert to get T_ce (cam->ego):
+        # T_ce = inv(T_ec) -> R_ce, t_ce
+        rots = []
+        trans = []
+        for i in range(extri.shape[0]):
+            T_ec = extri[i].cpu().numpy()
+            R = T_ec[:3, :3]
+            t = T_ec[:3, 3]
+            # inverse of [R|t] is [R^T | -R^T t]
+            R_inv = R.T
+            t_inv = -R_inv @ t
+            rots.append(torch.from_numpy(R_inv).float())
+            trans.append(torch.from_numpy(t_inv).float())
+        rots = torch.stack(rots, dim=0)          # (N,3,3)
+        trans = torch.stack(trans, dim=0)        # (N,3)
+
+        # No online augmentation: identity transforms
+        post_rots = torch.eye(3).unsqueeze(0).repeat(len(cam_indices), 1, 1)
+        post_trans = torch.zeros(len(cam_indices), 3)
+
+        return imgs, rots, trans, intrins, post_rots, post_trans
+
+    def get_lidar_data(self, info: Dict[str, Any], nsweeps: int):
+        """
+        SimBEV 포맷 기본 구성에는 원시 LiDAR 포인트가 없다고 가정.
+        시각화 경로만 유지하기 위해 빈 텐서(3,0) 반환.
+        필요하면 visibility.npy를 읽어 의사 포인트를 만들도록 확장 가능.
+        """
+        return torch.empty(3, 0)
+
+    def get_binimg(self, info: Dict[str, Any]):
+        frame_dir = self._frame_dir(info)
+        bev = np.load(frame_dir / "bev.npy").astype(np.float32)  # (8,Hbev,Wbev)
+        bev = np.maximum.reduce(bev[[1, 2, 3]])                  # (H,W)
+        bev = bev[None, ...].astype(np.float32)
+        return torch.from_numpy(bev)
+
+    # -----------------------------
+    # PyTorch Dataset protocol
+    # -----------------------------
     def __len__(self):
-        return len(self.ixes)
+        return len(self.sample_infos)
+
+    def __str__(self):
+        return (f"SimBEV (file-based): {len(self)} samples. "
+                f"Split: {'train' if self.is_train else 'val'}. "
+                f"Augmentation: none (post_rots=I, post_trans=0)")
+
+    # -----------------------------
+    # Children classes (like LSS)
+    # -----------------------------
 
 
-class VizData(NuscData):
+class VizData(SimBEV):
     def __init__(self, *args, **kwargs):
         super(VizData, self).__init__(*args, **kwargs)
-    
+
     def __getitem__(self, index):
-        rec = self.ixes[index]
-        
-        cams = self.choose_cams()
-        imgs, rots, trans, intrins, post_rots, post_trans = self.get_image_data(rec, cams)
-        lidar_data = self.get_lidar_data(rec, nsweeps=3)
-        binimg = self.get_binimg(rec)
-        
+        info = self.sample_infos[index]
+        # per-frame cam list from meta
+        frame_dir = self._frame_dir(info)
+        with open(frame_dir / "meta.json", "r") as f:
+            meta = json.load(f)
+        all_cams: List[int] = meta.get("cam_idx", [0, 1, 2, 3, 4, 5])
+        cams = self.choose_cams(all_cams)
+
+        imgs, rots, trans, intrins, post_rots, post_trans = self.get_image_data(info, cams)
+        lidar_data = self.get_lidar_data(info, nsweeps=3)  # empty (3,0)
+        binimg = self.get_binimg(info)
+
         return imgs, rots, trans, intrins, post_rots, post_trans, lidar_data, binimg
 
 
-class SegmentationData(NuscData):
+class SegmentationData(SimBEV):
     def __init__(self, *args, **kwargs):
         super(SegmentationData, self).__init__(*args, **kwargs)
-    
+        self.target_hw = (128, 352)  # (H, W)
+
+    def _resize_and_adjust(self, imgs, intrins, post_rots, post_trans, target_hw):
+        Hn, Wn = target_hw
+        H0, W0 = imgs.shape[-2:]
+        sy = Hn / H0
+        sx = Wn / W0
+
+        # 1) 이미지 리사이즈 (bilinear, align_corners=False 권장)
+        imgs = F.interpolate(imgs, size=(Hn, Wn), mode='bilinear', align_corners=False)
+
+        # 2) intrinsics 보정 (fx, fy, cx, cy 스케일)
+        intrins = intrins.clone()
+        intrins[:, 0, 0] *= sx  # fx
+        intrins[:, 1, 1] *= sy  # fy
+        intrins[:, 0, 2] *= sx  # cx
+        intrins[:, 1, 2] *= sy  # cy
+
+        # 3) post_rots / post_trans에 스케일 합성 (3x3, 3-vector라고 가정)
+        S = post_rots.new_zeros(imgs.size(0) if imgs.dim()==4 else post_rots.size(0), 3, 3)
+        S[:, 0, 0] = sx
+        S[:, 1, 1] = sy
+        S[:, 2, 2] = 1.0
+
+        # S @ post_rots
+        post_rots = torch.bmm(S, post_rots)
+        # S @ post_trans
+        post_trans = torch.bmm(S, post_trans.unsqueeze(-1)).squeeze(-1)
+
+        return imgs, intrins, post_rots, post_trans
+
     def __getitem__(self, index):
-        rec = self.ixes[index]
+        info = self.sample_infos[index]
+        frame_dir = self._frame_dir(info)
+        with open(frame_dir / "meta.json", "r") as f:
+            meta = json.load(f)
+        all_cams = meta.get("cam_idx", [0, 1, 2, 3, 4, 5])
+        cams = self.choose_cams(all_cams)
 
-        cams = self.choose_cams()
-        imgs, rots, trans, intrins, post_rots, post_trans = self.get_image_data(rec, cams)
-        binimg = self.get_binimg(rec)
-        
+        imgs, rots, trans, intrins, post_rots, post_trans = self.get_image_data(info, cams)
+        binimg = self.get_binimg(info)
+
+        # (6,3,224,480) -> (6,3,128,352)
+        imgs, intrins, post_rots, post_trans = self._resize_and_adjust(
+            imgs, intrins, post_rots, post_trans, self.target_hw
+        )
         return imgs, rots, trans, intrins, post_rots, post_trans, binimg
-
 
 def worker_rnd_init(x):
     np.random.seed(13 + x)
@@ -243,25 +263,34 @@ def worker_rnd_init(x):
 
 def compile_data(version, dataroot, data_aug_conf, grid_conf, bsz,
                  nworkers, parser_name):
-    nusc = NuScenes(version='v1.0-{}'.format(version),
-                    dataroot=os.path.join(dataroot, version),
-                    verbose=False)
+    """
+    Kept the same signature for drop-in replacement.
+
+    Args:
+      - version: unused (kept for API compatibility)
+      - dataroot: path to SimBEV root (containing {split}_samples.json and split folders)
+      - parser_name: 'vizdata' | 'segmentationdata'
+    """
     parser = {
         'vizdata': VizData,
         'segmentationdata': SegmentationData,
     }[parser_name]
-    traindata = parser(nusc, is_train=True, data_aug_conf=data_aug_conf,
-                         grid_conf=grid_conf)
-    valdata = parser(nusc, is_train=False, data_aug_conf=data_aug_conf,
-                       grid_conf=grid_conf)
 
-    trainloader = torch.utils.data.DataLoader(traindata, batch_size=bsz,
-                                              shuffle=True,
-                                              num_workers=nworkers,
-                                              drop_last=True,
-                                              worker_init_fn=worker_rnd_init)
-    valloader = torch.utils.data.DataLoader(valdata, batch_size=bsz,
-                                            shuffle=False,
-                                            num_workers=nworkers)
+    traindata = parser(dataroot, is_train=True, data_aug_conf=data_aug_conf, grid_conf=grid_conf)
+    valdata = parser(dataroot, is_train=False, data_aug_conf=data_aug_conf, grid_conf=grid_conf)
 
+    trainloader = torch.utils.data.DataLoader(
+        traindata,
+        batch_size=bsz,
+        shuffle=True,
+        num_workers=nworkers,
+        drop_last=True,
+        worker_init_fn=worker_rnd_init
+    )
+    valloader = torch.utils.data.DataLoader(
+        valdata,
+        batch_size=bsz,
+        shuffle=False,
+        num_workers=nworkers
+    )
     return trainloader, valloader

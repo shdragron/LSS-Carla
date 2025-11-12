@@ -1,0 +1,1 @@
+python main.py train mini/trainval --dataroot=/home/user/JG_workspace/models/data --logdir=./runs --gpuid=0
