@@ -9,6 +9,11 @@ import numpy as np
 import os
 import argparse
 from pathlib import Path
+import wandb
+from tqdm import tqdm
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 
 from src.models import compile_model
 from src.data_simbev import compile_data
@@ -53,6 +58,12 @@ def train(
 
     # Resume from checkpoint
     resume=None,
+
+    # Wandb config
+    use_wandb=True,
+    wandb_project='lift-splat-shoot',
+    wandb_name=None,
+    wandb_entity=None,
 ):
     """
     Train LSS model on SimBEV dataset.
@@ -80,6 +91,10 @@ def train(
         val_step: Validation frequency (iterations)
         save_step: Checkpoint saving frequency (iterations)
         resume: Path to checkpoint to resume from
+        use_wandb: Enable Weights & Biases logging
+        wandb_project: W&B project name
+        wandb_name: W&B run name (auto-generated if None)
+        wandb_entity: W&B entity/team name
     """
 
     # Create log directory
@@ -104,6 +119,36 @@ def train(
         'Ncams': ncams,
     }
 
+    # Initialize wandb
+    if use_wandb:
+        wandb_config = {
+            'dataroot': dataroot,
+            'nepochs': nepochs,
+            'batch_size': bsz,
+            'learning_rate': lr,
+            'weight_decay': weight_decay,
+            'num_workers': nworkers,
+            'num_cameras': ncams,
+            'image_H': H,
+            'image_W': W,
+            'final_dim': final_dim,
+            'max_grad_norm': max_grad_norm,
+            'pos_weight': pos_weight,
+            'grid_conf': grid_conf,
+            'data_aug_conf': data_aug_conf,
+            'val_step': val_step,
+            'save_step': save_step,
+        }
+
+        wandb.init(
+            project=wandb_project,
+            name=wandb_name,
+            entity=wandb_entity,
+            config=wandb_config,
+            dir=logdir,
+        )
+        print(f"Wandb initialized: {wandb.run.name}")
+
     print("=" * 80)
     print("Training Configuration:")
     print(f"  Dataroot: {dataroot}")
@@ -113,6 +158,7 @@ def train(
     print(f"  Number of epochs: {nepochs}")
     print(f"  Number of cameras: {ncams}")
     print(f"  Image size: {H}x{W} -> {final_dim}")
+    print(f"  Wandb logging: {use_wandb}")
     print("=" * 80)
 
     # Load data
@@ -175,10 +221,10 @@ def train(
     best_val_iou = 0.0
 
     for epoch in range(start_epoch, nepochs):
-        print(f"Epoch {epoch + 1}/{nepochs}")
         np.random.seed()
 
-        for batchi, (imgs, rots, trans, intrins, post_rots, post_trans, binimgs) in enumerate(trainloader):
+        pbar = tqdm(trainloader, desc=f'Epoch {epoch+1}/{nepochs}')
+        for batchi, (imgs, rots, trans, intrins, post_rots, post_trans, binimgs) in enumerate(pbar):
             t0 = time()
 
             # Forward pass
@@ -206,33 +252,137 @@ def train(
 
             # Log training loss
             if counter % 10 == 0:
-                print(f"  [{counter:6d}] Loss: {loss.item():.4f}, Time: {t1-t0:.3f}s")
+                pbar.set_postfix({'loss': f'{loss.item():.4f}'})
                 writer.add_scalar('train/loss', loss.item(), counter)
+                if use_wandb:
+                    wandb.log({'train/loss': loss.item(), 'iteration': counter})
 
-            # Log training IoU
+            # Log training IoU and visualizations
             if counter % 50 == 0:
                 _, _, iou = get_batch_iou(preds, binimgs)
                 writer.add_scalar('train/iou', iou, counter)
                 writer.add_scalar('train/epoch', epoch, counter)
                 writer.add_scalar('train/step_time', t1 - t0, counter)
-                print(f"  [{counter:6d}] Train IoU: {iou:.4f}")
+                pbar.set_postfix({'loss': f'{loss.item():.4f}', 'iou': f'{iou:.4f}'})
+
+                if use_wandb:
+                    # Create BEV visualization
+                    # Get first sample from batch for visualization
+                    pred_vis = torch.sigmoid(preds[0, 0]).detach().cpu().numpy()  # (200, 200)
+                    gt_vis = binimgs[0, 0].detach().cpu().numpy()  # (200, 200)
+
+                    # Create side-by-side visualization
+                    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+                    # Ground Truth
+                    axes[0].imshow(gt_vis, cmap='gray', vmin=0, vmax=1, origin='lower')
+                    axes[0].set_title('Ground Truth BEV')
+                    axes[0].set_xlabel('X (meters)')
+                    axes[0].set_ylabel('Y (meters)')
+                    axes[0].grid(False)
+
+                    # Prediction
+                    axes[1].imshow(pred_vis, cmap='gray', vmin=0, vmax=1, origin='lower')
+                    axes[1].set_title('Prediction BEV')
+                    axes[1].set_xlabel('X (meters)')
+                    axes[1].set_ylabel('Y (meters)')
+                    axes[1].grid(False)
+
+                    # Overlay (GT in red, Pred in green)
+                    overlay = np.zeros((gt_vis.shape[0], gt_vis.shape[1], 3))
+                    overlay[:, :, 0] = gt_vis  # GT in red channel
+                    overlay[:, :, 1] = pred_vis  # Pred in green channel
+                    axes[2].imshow(overlay, origin='lower')
+                    axes[2].set_title('Overlay (GT=Red, Pred=Green, Match=Yellow)')
+                    axes[2].set_xlabel('X (meters)')
+                    axes[2].set_ylabel('Y (meters)')
+                    axes[2].grid(False)
+
+                    plt.tight_layout()
+
+                    # Log to wandb
+                    wandb.log({
+                        'train/iou': iou,
+                        'train/epoch': epoch,
+                        'train/step_time': t1 - t0,
+                        'train/bev_visualization': wandb.Image(fig),
+                        'iteration': counter,
+                    })
+
+                    plt.close(fig)
 
             # Validation
             if counter % val_step == 0:
-                print(f"\n  Running validation at iteration {counter}...")
+                tqdm.write(f"\n  Running validation at iteration {counter}...")
                 model.eval()
                 val_info = get_val_info(model, valloader, loss_fn, device)
+
+                # Get one validation batch for visualization
+                val_batch = next(iter(valloader))
+                with torch.no_grad():
+                    val_imgs, val_rots, val_trans, val_intrins, val_post_rots, val_post_trans, val_binimgs = val_batch
+                    val_preds = model(
+                        val_imgs.to(device),
+                        val_rots.to(device),
+                        val_trans.to(device),
+                        val_intrins.to(device),
+                        val_post_rots.to(device),
+                        val_post_trans.to(device),
+                    )
+
                 model.train()
 
-                print(f"  Validation - Loss: {val_info['loss']:.4f}, IoU: {val_info['iou']:.4f}")
+                tqdm.write(f"  Validation - Loss: {val_info['loss']:.4f}, IoU: {val_info['iou']:.4f}")
                 writer.add_scalar('val/loss', val_info['loss'], counter)
                 writer.add_scalar('val/iou', val_info['iou'], counter)
+
+                if use_wandb:
+                    # Create validation BEV visualization
+                    val_pred_vis = torch.sigmoid(val_preds[0, 0]).detach().cpu().numpy()
+                    val_gt_vis = val_binimgs[0, 0].cpu().numpy()
+
+                    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+                    # Ground Truth
+                    axes[0].imshow(val_gt_vis, cmap='gray', vmin=0, vmax=1, origin='lower')
+                    axes[0].set_title('Val Ground Truth BEV')
+                    axes[0].set_xlabel('X (meters)')
+                    axes[0].set_ylabel('Y (meters)')
+                    axes[0].grid(False)
+
+                    # Prediction
+                    axes[1].imshow(val_pred_vis, cmap='gray', vmin=0, vmax=1, origin='lower')
+                    axes[1].set_title('Val Prediction BEV')
+                    axes[1].set_xlabel('X (meters)')
+                    axes[1].set_ylabel('Y (meters)')
+                    axes[1].grid(False)
+
+                    # Overlay
+                    overlay = np.zeros((val_gt_vis.shape[0], val_gt_vis.shape[1], 3))
+                    overlay[:, :, 0] = val_gt_vis
+                    overlay[:, :, 1] = val_pred_vis
+                    axes[2].imshow(overlay, origin='lower')
+                    axes[2].set_title('Overlay (GT=Red, Pred=Green, Match=Yellow)')
+                    axes[2].set_xlabel('X (meters)')
+                    axes[2].set_ylabel('Y (meters)')
+                    axes[2].grid(False)
+
+                    plt.tight_layout()
+
+                    wandb.log({
+                        'val/loss': val_info['loss'],
+                        'val/iou': val_info['iou'],
+                        'val/bev_visualization': wandb.Image(fig),
+                        'iteration': counter,
+                    })
+
+                    plt.close(fig)
 
                 # Save best model
                 if val_info['iou'] > best_val_iou:
                     best_val_iou = val_info['iou']
                     best_path = os.path.join(logdir, "model_best.pt")
-                    print(f"  New best IoU: {best_val_iou:.4f}, saving to {best_path}")
+                    tqdm.write(f"  New best IoU: {best_val_iou:.4f}, saving to {best_path}")
                     torch.save({
                         'model_state_dict': model.state_dict(),
                         'optimizer_state_dict': opt.state_dict(),
@@ -240,13 +390,14 @@ def train(
                         'epoch': epoch,
                         'val_iou': best_val_iou,
                     }, best_path)
-                print()
+                    if use_wandb:
+                        wandb.run.summary["best_val_iou"] = best_val_iou
 
             # Save checkpoint
             if counter % save_step == 0:
                 model.eval()
                 ckpt_path = os.path.join(logdir, f"model_{counter:06d}.pt")
-                print(f"  Saving checkpoint to {ckpt_path}")
+                tqdm.write(f"  Saving checkpoint to {ckpt_path}")
                 torch.save({
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': opt.state_dict(),
@@ -266,6 +417,10 @@ def train(
     }, final_path)
 
     writer.close()
+
+    if use_wandb:
+        wandb.finish()
+
     print(f"Best validation IoU: {best_val_iou:.4f}")
 
 
@@ -312,6 +467,16 @@ def main():
     parser.add_argument('--resume', type=str, default=None,
                         help='Path to checkpoint to resume from')
 
+    # Wandb arguments
+    parser.add_argument('--use_wandb', action='store_true', default=False,
+                        help='Enable Weights & Biases logging')
+    parser.add_argument('--wandb_project', type=str, default='lift-splat-shoot',
+                        help='W&B project name')
+    parser.add_argument('--wandb_name', type=str, default=None,
+                        help='W&B run name (auto-generated if not specified)')
+    parser.add_argument('--wandb_entity', type=str, default=None,
+                        help='W&B entity/team name')
+
     args = parser.parse_args()
 
     train(
@@ -330,6 +495,10 @@ def main():
         val_step=args.val_step,
         save_step=args.save_step,
         resume=args.resume,
+        use_wandb=args.use_wandb,
+        wandb_project=args.wandb_project,
+        wandb_name=args.wandb_name,
+        wandb_entity=args.wandb_entity,
     )
 
 

@@ -26,21 +26,28 @@ class SimBEVDataset(torch.utils.data.Dataset):
 
     Directory structure expected:
       dataroot/
-        train/
-          scene_name/
-            orientation_folder/  (e.g., yaw0pitch0/)
+        SimBEV_cvt_label/
+          scene_0000/
+            yaw0pitch0/
               meta.json          # list of sample dictionaries
-              images/            # camera images
-              labels/            # BEV segmentation maps
-        val/
+              bev_*.npz          # BEV segmentation maps
+              aux_*.npz          # auxiliary data
+              visibility_*.png   # visibility masks
+          scene_0001/
+            ...
+        sweeps/
+          RGB-CAM_FRONT/
+            *.jpg              # camera images
+          RGB-CAM_FRONT_LEFT/
+            *.jpg
           ...
 
     Each sample in meta.json should contain:
       - token: unique sample identifier
-      - images: list of image file paths (6 cameras)
+      - images: list of image file paths relative to dataroot (6 cameras)
       - intrinsics: list of 3x3 camera intrinsic matrices (6 cameras)
       - extrinsics: list of 4x4 extrinsic matrices (ego->camera transform) (6 cameras)
-      - label: BEV segmentation map file path
+      - bev: BEV .npz file path relative to meta_dir
     """
 
     def __init__(self, dataroot, is_train, data_aug_conf, grid_conf):
@@ -48,9 +55,6 @@ class SimBEVDataset(torch.utils.data.Dataset):
         self.is_train = is_train
         self.data_aug_conf = data_aug_conf
         self.grid_conf = grid_conf
-
-        self.split = 'train' if is_train else 'val'
-        self.split_dir = self.dataroot / self.split
 
         # Load all samples from all scenes
         self.samples = self._load_all_samples()
@@ -62,17 +66,32 @@ class SimBEVDataset(torch.utils.data.Dataset):
         print(self)
 
     def _load_all_samples(self):
-        """Load all samples from all scenes in the split directory."""
+        """Load all samples from all scenes in the label directory."""
         all_samples = []
 
-        if not self.split_dir.exists():
-            raise FileNotFoundError(f"Split directory not found: {self.split_dir}")
+        # Labels are in SimBEV_cvt_label directory
+        labels_dir = self.dataroot / 'SimBEV_cvt_label'
 
-        # Iterate through all scene directories
-        for scene_dir in sorted(self.split_dir.iterdir()):
-            if not scene_dir.is_dir():
-                continue
+        if not labels_dir.exists():
+            raise FileNotFoundError(f"Labels directory not found: {labels_dir}")
 
+        # Get all scene directories
+        scene_dirs = sorted([d for d in labels_dir.iterdir() if d.is_dir() and d.name.startswith('scene_')])
+
+        if not scene_dirs:
+            raise FileNotFoundError(f"No scene directories found in {labels_dir}")
+
+        # Split scenes into train/val (80/20 split)
+        num_scenes = len(scene_dirs)
+        train_split = int(0.8 * num_scenes)
+
+        if self.is_train:
+            selected_scenes = scene_dirs[:train_split]
+        else:
+            selected_scenes = scene_dirs[train_split:]
+
+        # Iterate through selected scene directories
+        for scene_dir in selected_scenes:
             # Look for meta.json files (could be in orientation subdirectories)
             meta_files = list(scene_dir.rglob('meta.json'))
 
@@ -87,7 +106,8 @@ class SimBEVDataset(torch.utils.data.Dataset):
                     all_samples.append(sample)
 
         if not all_samples:
-            raise FileNotFoundError(f"No samples found in {self.split_dir}")
+            split_name = 'train' if self.is_train else 'val'
+            raise FileNotFoundError(f"No samples found for {split_name} split in {labels_dir}")
 
         return all_samples
 
@@ -131,8 +151,6 @@ class SimBEVDataset(torch.utils.data.Dataset):
             post_rots: (N, 3, 3) post-processing rotation matrices
             post_trans: (N, 3) post-processing translation vectors
         """
-        meta_dir = sample['meta_dir']
-
         imgs = []
         rots = []
         trans = []
@@ -146,8 +164,8 @@ class SimBEVDataset(torch.utils.data.Dataset):
         image_paths = sample['images']  # List of image paths
 
         for cam_idx in cam_indices:
-            # Load image
-            img_path = meta_dir / image_paths[cam_idx]
+            # Load image (path is relative to dataroot)
+            img_path = self.dataroot / image_paths[cam_idx]
             img = Image.open(img_path)
 
             # Initial transforms
@@ -157,18 +175,12 @@ class SimBEVDataset(torch.utils.data.Dataset):
             # Camera intrinsics
             intrin = torch.Tensor(intrinsics_list[cam_idx])
 
-            # Extrinsics: ego->cam, we need cam->ego
-            # extrinsic is 4x4 matrix: [R|t; 0 0 0 1]
+            # Extrinsics: SimBEV provides ego->cam transformation
+            # LSS uses it directly - see models.py:182-184
+            # The naming is confusing but LSS actually uses ego->cam format
             extrin_mat = np.array(extrinsics_list[cam_idx])
-            R_ego_cam = extrin_mat[:3, :3]
-            t_ego_cam = extrin_mat[:3, 3]
-
-            # Invert to get cam->ego
-            R_cam_ego = R_ego_cam.T
-            t_cam_ego = -R_cam_ego @ t_ego_cam
-
-            rot = torch.Tensor(R_cam_ego)
-            tran = torch.Tensor(t_cam_ego)
+            rot = torch.Tensor(extrin_mat[:3, :3])
+            tran = torch.Tensor(extrin_mat[:3, 3])
 
             # Apply data augmentation
             resize, resize_dims, crop, flip, rotate_angle = self.sample_augmentation()
@@ -199,32 +211,24 @@ class SimBEVDataset(torch.utils.data.Dataset):
 
     def get_binimg(self, sample):
         """
-        Load BEV segmentation map.
+        Load BEV segmentation map from .npz file.
 
         Returns:
-            binimg: (1, H, W) binary segmentation map
+            binimg: (1, H, W) binary segmentation map (vehicle class only)
         """
         meta_dir = sample['meta_dir']
-        label_path = meta_dir / sample['label']
+        bev_path = meta_dir / sample['bev']
 
-        # Load label (assuming it's saved as numpy array or image)
-        if label_path.suffix == '.npy':
-            binimg = np.load(label_path)
-        else:
-            # Try loading as image
-            binimg = np.array(Image.open(label_path))
+        # Load BEV from .npz file
+        bev_data = np.load(bev_path)
+        bev = bev_data['bev']  # Shape: (8, 200, 200) - 8 classes
 
-        # Ensure it's float32 and has shape (1, H, W) or convert it
-        if binimg.ndim == 2:
-            binimg = binimg[np.newaxis, ...]
-        elif binimg.ndim == 3:
-            # If it's (H, W, C), take first channel or convert
-            if binimg.shape[2] > 1:
-                # Assume vehicle class is in a specific channel or reduce
-                binimg = np.max(binimg, axis=2, keepdims=False)
-            binimg = binimg[np.newaxis, ...]
+        # Vehicle classes are indices 1, 2, 3 (different vehicle types)
+        # Merge them into a single binary vehicle segmentation
+        vehicle_mask = ((bev[1] > 0) | (bev[2] > 0) | (bev[3] > 0)).astype(np.float32)
+        binimg = vehicle_mask[np.newaxis, :, :]  # Shape: (1, 200, 200)
 
-        return torch.from_numpy(binimg.astype(np.float32))
+        return torch.from_numpy(binimg)
 
     def choose_cams(self):
         """Choose which cameras to use."""
@@ -242,9 +246,8 @@ class SimBEVDataset(torch.utils.data.Dataset):
         return len(self.samples)
 
     def __str__(self):
-        return (f"SimBEVDataset: {len(self)} samples. "
-                f"Split: {'train' if self.is_train else 'val'}. "
-                f"Augmentation Conf: {self.data_aug_conf}")
+        split_name = 'train' if self.is_train else 'val'
+        return (f"SimBEVDataset ({split_name}): {len(self)} samples")
 
 
 class VizData(SimBEVDataset):

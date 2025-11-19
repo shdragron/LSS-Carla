@@ -2,13 +2,13 @@
 
 # SimBEV 소규모 실험용 설정 (빠른 테스트)
 
-DATAROOT="/path/to/simbev/dataset"
+DATAROOT="/data/SimBEV"
 
 GPUID=0
-EPOCHS=10
-BATCH_SIZE=2
-NUM_WORKERS=2
-LEARNING_RATE=0.001
+EPOCHS=25
+BATCH_SIZE=8
+NUM_WORKERS=8
+LEARNING_RATE=0.0005
 
 IMAGE_H=224
 IMAGE_W=480
@@ -31,5 +31,8 @@ python train_simbev.py \
     --final_w $FINAL_W \
     --ncams $NUM_CAMS \
     --logdir $LOGDIR \
-    --val_step 50 \
-    --save_step 100
+    --val_step 8640 \
+    --save_step 4320 \
+    --use_wandb \
+    --wandb_project SIMBEV-lift-splat-shoot \
+    --wandb_name simbev_small_experiment

@@ -20,3 +20,32 @@ __pycache__/
 .env
 outputs/
 wandb/
+
+# training runs & checkpoints
+runs/
+*.pt
+!model525000.pt
+
+# temporary files
+cmd.txt
+
+# Debug outputs
+debug_outputs/
+viz_outputs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter notebooks
+.ipynb_checkpoints/
+*.ipynb
+
+# Logs
+*.log

@@ -1,0 +1,26 @@
+# Core dependencies
+torch>=1.9.0
+torchvision>=0.10.0
+numpy>=1.19.0
+
+# Model architecture
+efficientnet-pytorch>=0.7.1
+
+# Training utilities
+tensorboardX>=2.4
+tqdm>=4.62.0
+
+# Logging and visualization
+wandb>=0.12.0
+matplotlib>=3.3.4
+Pillow>=8.3.0
+
+# Data processing
+pyquaternion>=0.9.9
+
+# nuScenes (for original LSS)
+# nuscenes-devkit>=1.1.9
+
+# Optional: Development tools
+# ipython>=7.27.0
+# jupyter>=1.0.0
