@@ -226,6 +226,13 @@ class SimBEVDataset(torch.utils.data.Dataset):
         # Vehicle classes are indices 1, 2, 3 (different vehicle types)
         # Merge them into a single binary vehicle segmentation
         vehicle_mask = ((bev[1] > 0) | (bev[2] > 0) | (bev[3] > 0)).astype(np.float32)
+
+        # IMPORTANT: SimBEV coordinate system is different from LSS
+        # SimBEV: low column index = front of car
+        # LSS: high column index = front of car
+        # Solution: Flip left-right (along X-axis)
+        vehicle_mask = np.fliplr(vehicle_mask).copy()  # .copy() to avoid negative stride
+
         binimg = vehicle_mask[np.newaxis, :, :]  # Shape: (1, 200, 200)
 
         return torch.from_numpy(binimg)

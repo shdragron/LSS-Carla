@@ -2,6 +2,11 @@
 Debug script to verify data loading and GT processing
 """
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+
 import torch
 import numpy as np
 import matplotlib.pyplot as plt

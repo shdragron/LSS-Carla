@@ -2,6 +2,11 @@
 Verify which BEV class corresponds to vehicles by visualizing all classes
 """
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+
 import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
