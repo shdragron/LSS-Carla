@@ -92,18 +92,23 @@ class SimBEVDataset(torch.utils.data.Dataset):
 
         # Iterate through selected scene directories
         for scene_dir in selected_scenes:
-            # Look for meta.json files (could be in orientation subdirectories)
-            meta_files = list(scene_dir.rglob('meta.json'))
+            # Only use yaw0pitch0 orientation
+            yaw0pitch0_dir = scene_dir / 'yaw0pitch0'
+            if not yaw0pitch0_dir.exists():
+                continue
 
-            for meta_path in meta_files:
-                with open(meta_path, 'r') as f:
-                    meta_samples = json.load(f)
+            meta_path = yaw0pitch0_dir / 'meta.json'
+            if not meta_path.exists():
+                continue
 
-                # Add scene and base directory information to each sample
-                for sample in meta_samples:
-                    sample['scene_dir'] = scene_dir
-                    sample['meta_dir'] = meta_path.parent
-                    all_samples.append(sample)
+            with open(meta_path, 'r') as f:
+                meta_samples = json.load(f)
+
+            # Add scene and base directory information to each sample
+            for sample in meta_samples:
+                sample['scene_dir'] = scene_dir
+                sample['meta_dir'] = meta_path.parent
+                all_samples.append(sample)
 
         if not all_samples:
             split_name = 'train' if self.is_train else 'val'
@@ -158,6 +163,10 @@ class SimBEVDataset(torch.utils.data.Dataset):
         post_rots = []
         post_trans = []
 
+        # Sample augmentation parameters ONCE per sample (not per camera)
+        # This ensures all cameras in the same sample use the same augmentation
+        resize, resize_dims, crop, flip, rotate_angle = self.sample_augmentation()
+
         # Load intrinsics and extrinsics
         intrinsics_list = sample['intrinsics']  # List of 3x3 matrices
         extrinsics_list = sample['extrinsics']  # List of 4x4 matrices (ego->cam)
@@ -182,8 +191,7 @@ class SimBEVDataset(torch.utils.data.Dataset):
             rot = torch.Tensor(extrin_mat[:3, :3])
             tran = torch.Tensor(extrin_mat[:3, 3])
 
-            # Apply data augmentation
-            resize, resize_dims, crop, flip, rotate_angle = self.sample_augmentation()
+            # Apply data augmentation (using parameters sampled once per sample)
             img, post_rot2, post_tran2 = img_transform(
                 img, post_rot, post_tran,
                 resize=resize,

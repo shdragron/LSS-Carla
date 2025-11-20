@@ -191,6 +191,12 @@ def train(
     # Setup optimizer
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 
+    # Setup learning rate scheduler
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        opt, mode='min', factor=0.5, patience=5, verbose=True,
+        threshold=1e-4, min_lr=1e-6
+    )
+
     # Setup loss function
     loss_fn = SimpleLoss(pos_weight).to(device)
 
@@ -219,9 +225,16 @@ def train(
 
     model.train()
     best_val_iou = 0.0
+    best_val_loss = float('inf')
+    patience_counter = 0
+    early_stop_patience = 20  # Stop if no improvement for 20 validation checks
 
     for epoch in range(start_epoch, nepochs):
         np.random.seed()
+
+        # Check if early stopping was triggered in previous epoch
+        if patience_counter >= early_stop_patience:
+            break
 
         pbar = tqdm(trainloader, desc=f'Epoch {epoch+1}/{nepochs}')
         for batchi, (imgs, rots, trans, intrins, post_rots, post_trans, binimgs) in enumerate(pbar):
@@ -332,9 +345,14 @@ def train(
 
                 model.train()
 
-                tqdm.write(f"  Validation - Loss: {val_info['loss']:.4f}, IoU: {val_info['iou']:.4f}")
+                # Update learning rate based on validation loss
+                scheduler.step(val_info['loss'])
+                current_lr = opt.param_groups[0]['lr']
+
+                tqdm.write(f"  Validation - Loss: {val_info['loss']:.4f}, IoU: {val_info['iou']:.4f}, LR: {current_lr:.6f}")
                 writer.add_scalar('val/loss', val_info['loss'], counter)
                 writer.add_scalar('val/iou', val_info['iou'], counter)
+                writer.add_scalar('train/lr', current_lr, counter)
 
                 if use_wandb:
                     # Create validation BEV visualization
@@ -373,12 +391,21 @@ def train(
                         'val/loss': val_info['loss'],
                         'val/iou': val_info['iou'],
                         'val/bev_visualization': wandb.Image(fig),
+                        'train/lr': current_lr,
                         'iteration': counter,
                     })
 
                     plt.close(fig)
 
-                # Save best model
+                # Early stopping check
+                if val_info['loss'] < best_val_loss:
+                    best_val_loss = val_info['loss']
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+                    tqdm.write(f"  No improvement in validation loss for {patience_counter}/{early_stop_patience} checks")
+
+                # Save best model based on IoU
                 if val_info['iou'] > best_val_iou:
                     best_val_iou = val_info['iou']
                     best_path = os.path.join(logdir, "model_best.pt")
@@ -386,12 +413,21 @@ def train(
                     torch.save({
                         'model_state_dict': model.state_dict(),
                         'optimizer_state_dict': opt.state_dict(),
+                        'scheduler_state_dict': scheduler.state_dict(),
                         'counter': counter,
                         'epoch': epoch,
                         'val_iou': best_val_iou,
+                        'val_loss': val_info['loss'],
                     }, best_path)
                     if use_wandb:
                         wandb.run.summary["best_val_iou"] = best_val_iou
+                        wandb.run.summary["best_val_loss"] = best_val_loss
+
+                # Check early stopping
+                if patience_counter >= early_stop_patience:
+                    tqdm.write(f"\n  Early stopping triggered! No improvement for {early_stop_patience} validation checks.")
+                    tqdm.write(f"  Best validation loss: {best_val_loss:.4f}, Best IoU: {best_val_iou:.4f}")
+                    break
 
             # Save checkpoint
             if counter % save_step == 0:

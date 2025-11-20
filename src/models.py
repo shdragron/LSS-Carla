@@ -43,6 +43,7 @@ class CamEncode(nn.Module):
         self.trunk = EfficientNet.from_pretrained("efficientnet-b0")
 
         self.up1 = Up(320+112, 512)
+        self.dropout = nn.Dropout(0.2)
         self.depthnet = nn.Conv2d(512, self.D + self.C, kernel_size=1, padding=0)
 
     def get_depth_dist(self, x, eps=1e-20):
@@ -51,6 +52,7 @@ class CamEncode(nn.Module):
     def get_depth_feat(self, x):
         x = self.get_eff_depth(x)
         # Depth
+        x = self.dropout(x)
         x = self.depthnet(x)
 
         depth = self.get_depth_dist(x[:, :self.D])
@@ -102,6 +104,7 @@ class BevEncode(nn.Module):
         self.layer3 = trunk.layer3
 
         self.up1 = Up(64+256, 256, scale_factor=4)
+        self.dropout = nn.Dropout2d(0.1)
         self.up2 = nn.Sequential(
             nn.Upsample(scale_factor=2, mode='bilinear',
                               align_corners=True),
@@ -121,6 +124,7 @@ class BevEncode(nn.Module):
         x = self.layer3(x)
 
         x = self.up1(x, x1)
+        x = self.dropout(x)
         x = self.up2(x)
 
         return x
