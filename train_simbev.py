@@ -28,11 +28,11 @@ def train(
     # Image config
     H=224,
     W=480,
-    resize_lim=(0.9, 1.1),
+    resize_lim=(1.0, 1.0),  # No resize augmentation
     final_dim=(128, 352),
-    bot_pct_lim=(0.0, 0.0),
-    rot_lim=(-5.4, 5.4),
-    rand_flip=True,
+    bot_pct_lim=(0.0, 0.0),  # No bottom crop
+    rot_lim=(0.0, 0.0),  # No rotation augmentation
+    rand_flip=False,  # No horizontal flip augmentation
     ncams=6,
 
     # Training config
@@ -191,12 +191,6 @@ def train(
     # Setup optimizer
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 
-    # Setup learning rate scheduler
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        opt, mode='min', factor=0.5, patience=5, verbose=True,
-        threshold=1e-4, min_lr=1e-6
-    )
-
     # Setup loss function
     loss_fn = SimpleLoss(pos_weight).to(device)
 
@@ -225,16 +219,9 @@ def train(
 
     model.train()
     best_val_iou = 0.0
-    best_val_loss = float('inf')
-    patience_counter = 0
-    early_stop_patience = 20  # Stop if no improvement for 20 validation checks
 
     for epoch in range(start_epoch, nepochs):
         np.random.seed()
-
-        # Check if early stopping was triggered in previous epoch
-        if patience_counter >= early_stop_patience:
-            break
 
         pbar = tqdm(trainloader, desc=f'Epoch {epoch+1}/{nepochs}')
         for batchi, (imgs, rots, trans, intrins, post_rots, post_trans, binimgs) in enumerate(pbar):
@@ -271,7 +258,7 @@ def train(
                     wandb.log({'train/loss': loss.item(), 'iteration': counter})
 
             # Log training IoU and visualizations
-            if counter % 50 == 0:
+            if counter % 100 == 0:
                 _, _, iou = get_batch_iou(preds, binimgs)
                 writer.add_scalar('train/iou', iou, counter)
                 writer.add_scalar('train/epoch', epoch, counter)
@@ -279,38 +266,55 @@ def train(
                 pbar.set_postfix({'loss': f'{loss.item():.4f}', 'iou': f'{iou:.4f}'})
 
                 if use_wandb:
-                    # Create BEV visualization
-                    # Get first sample from batch for visualization
+                    # Create comprehensive visualization with 6 camera views + BEV
                     pred_vis = torch.sigmoid(preds[0, 0]).detach().cpu().numpy()  # (200, 200)
                     gt_vis = binimgs[0, 0].detach().cpu().numpy()  # (200, 200)
 
-                    # Create side-by-side visualization
-                    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+                    # Get camera images (first sample in batch)
+                    cam_imgs = imgs[0].detach().cpu().numpy()  # (6, 3, H, W)
+                    cam_names = ['FRONT_LEFT', 'FRONT', 'FRONT_RIGHT', 'BACK_LEFT', 'BACK', 'BACK_RIGHT']
 
-                    # Ground Truth
-                    axes[0].imshow(gt_vis, cmap='gray', vmin=0, vmax=1, origin='lower')
-                    axes[0].set_title('Ground Truth BEV')
-                    axes[0].set_xlabel('X (meters)')
-                    axes[0].set_ylabel('Y (meters)')
-                    axes[0].grid(False)
+                    # Create figure: 3 rows (cameras, BEV GTs, BEV preds)
+                    fig = plt.figure(figsize=(20, 12))
 
-                    # Prediction
-                    axes[1].imshow(pred_vis, cmap='gray', vmin=0, vmax=1, origin='lower')
-                    axes[1].set_title('Prediction BEV')
-                    axes[1].set_xlabel('X (meters)')
-                    axes[1].set_ylabel('Y (meters)')
-                    axes[1].grid(False)
+                    # Row 1: 6 camera views
+                    for i in range(6):
+                        ax = plt.subplot(3, 6, i + 1)
+                        img = cam_imgs[i].transpose(1, 2, 0)  # (H, W, 3)
+                        # Normalize to [0, 1] for display
+                        img = (img - img.min()) / (img.max() - img.min() + 1e-8)
+                        ax.imshow(img)
+                        ax.set_title(cam_names[i], fontsize=10, fontweight='bold')
+                        ax.axis('off')
 
-                    # Overlay (GT in red, Pred in green)
+                    # Row 2: BEV Ground Truth
+                    ax = plt.subplot(3, 3, 7)
+                    ax.imshow(gt_vis, cmap='hot', vmin=0, vmax=1, origin='lower', extent=[-50, 50, -50, 50])
+                    ax.set_title('BEV Ground Truth', fontsize=12, fontweight='bold')
+                    ax.set_xlabel('X (m)', fontsize=10)
+                    ax.set_ylabel('Y (m)', fontsize=10)
+                    ax.grid(True, alpha=0.3)
+
+                    # Row 2: BEV Prediction
+                    ax = plt.subplot(3, 3, 8)
+                    ax.imshow(pred_vis, cmap='hot', vmin=0, vmax=1, origin='lower', extent=[-50, 50, -50, 50])
+                    ax.set_title('BEV Prediction', fontsize=12, fontweight='bold')
+                    ax.set_xlabel('X (m)', fontsize=10)
+                    ax.set_ylabel('Y (m)', fontsize=10)
+                    ax.grid(True, alpha=0.3)
+
+                    # Row 2: BEV Overlay
+                    ax = plt.subplot(3, 3, 9)
                     overlay = np.zeros((gt_vis.shape[0], gt_vis.shape[1], 3))
-                    overlay[:, :, 0] = gt_vis  # GT in red channel
-                    overlay[:, :, 1] = pred_vis  # Pred in green channel
-                    axes[2].imshow(overlay, origin='lower')
-                    axes[2].set_title('Overlay (GT=Red, Pred=Green, Match=Yellow)')
-                    axes[2].set_xlabel('X (meters)')
-                    axes[2].set_ylabel('Y (meters)')
-                    axes[2].grid(False)
+                    overlay[:, :, 0] = gt_vis  # GT in red
+                    overlay[:, :, 1] = pred_vis  # Pred in green
+                    ax.imshow(overlay, origin='lower', extent=[-50, 50, -50, 50])
+                    ax.set_title('Overlay (GT=Red, Pred=Green, Match=Yellow)', fontsize=12, fontweight='bold')
+                    ax.set_xlabel('X (m)', fontsize=10)
+                    ax.set_ylabel('Y (m)', fontsize=10)
+                    ax.grid(True, alpha=0.3)
 
+                    plt.suptitle(f'Training Iteration {counter} | IoU: {iou:.4f}', fontsize=14, fontweight='bold')
                     plt.tight_layout()
 
                     # Log to wandb
@@ -318,7 +322,7 @@ def train(
                         'train/iou': iou,
                         'train/epoch': epoch,
                         'train/step_time': t1 - t0,
-                        'train/bev_visualization': wandb.Image(fig),
+                        'train/visualization': wandb.Image(fig),
                         'iteration': counter,
                     })
 
@@ -345,65 +349,70 @@ def train(
 
                 model.train()
 
-                # Update learning rate based on validation loss
-                scheduler.step(val_info['loss'])
-                current_lr = opt.param_groups[0]['lr']
-
-                tqdm.write(f"  Validation - Loss: {val_info['loss']:.4f}, IoU: {val_info['iou']:.4f}, LR: {current_lr:.6f}")
+                tqdm.write(f"  Validation - Loss: {val_info['loss']:.4f}, IoU: {val_info['iou']:.4f}")
                 writer.add_scalar('val/loss', val_info['loss'], counter)
                 writer.add_scalar('val/iou', val_info['iou'], counter)
-                writer.add_scalar('train/lr', current_lr, counter)
 
                 if use_wandb:
-                    # Create validation BEV visualization
+                    # Create comprehensive validation visualization with 6 camera views + BEV
                     val_pred_vis = torch.sigmoid(val_preds[0, 0]).detach().cpu().numpy()
                     val_gt_vis = val_binimgs[0, 0].cpu().numpy()
 
-                    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+                    # Get validation camera images
+                    val_cam_imgs = val_imgs[0].cpu().numpy()  # (6, 3, H, W)
+                    cam_names = ['FRONT_LEFT', 'FRONT', 'FRONT_RIGHT', 'BACK_LEFT', 'BACK', 'BACK_RIGHT']
 
-                    # Ground Truth
-                    axes[0].imshow(val_gt_vis, cmap='gray', vmin=0, vmax=1, origin='lower')
-                    axes[0].set_title('Val Ground Truth BEV')
-                    axes[0].set_xlabel('X (meters)')
-                    axes[0].set_ylabel('Y (meters)')
-                    axes[0].grid(False)
+                    # Create figure: 3 rows (cameras, BEV GTs, BEV preds)
+                    fig = plt.figure(figsize=(20, 12))
 
-                    # Prediction
-                    axes[1].imshow(val_pred_vis, cmap='gray', vmin=0, vmax=1, origin='lower')
-                    axes[1].set_title('Val Prediction BEV')
-                    axes[1].set_xlabel('X (meters)')
-                    axes[1].set_ylabel('Y (meters)')
-                    axes[1].grid(False)
+                    # Row 1: 6 camera views
+                    for i in range(6):
+                        ax = plt.subplot(3, 6, i + 1)
+                        img = val_cam_imgs[i].transpose(1, 2, 0)  # (H, W, 3)
+                        img = (img - img.min()) / (img.max() - img.min() + 1e-8)
+                        ax.imshow(img)
+                        ax.set_title(cam_names[i], fontsize=10, fontweight='bold')
+                        ax.axis('off')
 
-                    # Overlay
+                    # Row 2: BEV Ground Truth
+                    ax = plt.subplot(3, 3, 7)
+                    ax.imshow(val_gt_vis, cmap='hot', vmin=0, vmax=1, origin='lower', extent=[-50, 50, -50, 50])
+                    ax.set_title('BEV Ground Truth', fontsize=12, fontweight='bold')
+                    ax.set_xlabel('X (m)', fontsize=10)
+                    ax.set_ylabel('Y (m)', fontsize=10)
+                    ax.grid(True, alpha=0.3)
+
+                    # Row 2: BEV Prediction
+                    ax = plt.subplot(3, 3, 8)
+                    ax.imshow(val_pred_vis, cmap='hot', vmin=0, vmax=1, origin='lower', extent=[-50, 50, -50, 50])
+                    ax.set_title('BEV Prediction', fontsize=12, fontweight='bold')
+                    ax.set_xlabel('X (m)', fontsize=10)
+                    ax.set_ylabel('Y (m)', fontsize=10)
+                    ax.grid(True, alpha=0.3)
+
+                    # Row 2: BEV Overlay
+                    ax = plt.subplot(3, 3, 9)
                     overlay = np.zeros((val_gt_vis.shape[0], val_gt_vis.shape[1], 3))
-                    overlay[:, :, 0] = val_gt_vis
-                    overlay[:, :, 1] = val_pred_vis
-                    axes[2].imshow(overlay, origin='lower')
-                    axes[2].set_title('Overlay (GT=Red, Pred=Green, Match=Yellow)')
-                    axes[2].set_xlabel('X (meters)')
-                    axes[2].set_ylabel('Y (meters)')
-                    axes[2].grid(False)
+                    overlay[:, :, 0] = val_gt_vis  # GT in red
+                    overlay[:, :, 1] = val_pred_vis  # Pred in green
+                    ax.imshow(overlay, origin='lower', extent=[-50, 50, -50, 50])
+                    ax.set_title('Overlay (GT=Red, Pred=Green, Match=Yellow)', fontsize=12, fontweight='bold')
+                    ax.set_xlabel('X (m)', fontsize=10)
+                    ax.set_ylabel('Y (m)', fontsize=10)
+                    ax.grid(True, alpha=0.3)
 
+                    plt.suptitle(f'Validation Iteration {counter} | IoU: {val_info["iou"]:.4f}', fontsize=14, fontweight='bold')
                     plt.tight_layout()
 
                     wandb.log({
                         'val/loss': val_info['loss'],
                         'val/iou': val_info['iou'],
-                        'val/bev_visualization': wandb.Image(fig),
-                        'train/lr': current_lr,
+                        'val/visualization': wandb.Image(fig),
+                        'train/lr': lr,
                         'iteration': counter,
                     })
 
                     plt.close(fig)
-
-                # Early stopping check
-                if val_info['loss'] < best_val_loss:
-                    best_val_loss = val_info['loss']
-                    patience_counter = 0
-                else:
-                    patience_counter += 1
-                    tqdm.write(f"  No improvement in validation loss for {patience_counter}/{early_stop_patience} checks")
 
                 # Save best model based on IoU
                 if val_info['iou'] > best_val_iou:
@@ -413,21 +422,12 @@ def train(
                     torch.save({
                         'model_state_dict': model.state_dict(),
                         'optimizer_state_dict': opt.state_dict(),
-                        'scheduler_state_dict': scheduler.state_dict(),
                         'counter': counter,
                         'epoch': epoch,
                         'val_iou': best_val_iou,
-                        'val_loss': val_info['loss'],
                     }, best_path)
                     if use_wandb:
                         wandb.run.summary["best_val_iou"] = best_val_iou
-                        wandb.run.summary["best_val_loss"] = best_val_loss
-
-                # Check early stopping
-                if patience_counter >= early_stop_patience:
-                    tqdm.write(f"\n  Early stopping triggered! No improvement for {early_stop_patience} validation checks.")
-                    tqdm.write(f"  Best validation loss: {best_val_loss:.4f}, Best IoU: {best_val_iou:.4f}")
-                    break
 
             # Save checkpoint
             if counter % save_step == 0:
